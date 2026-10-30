@@ -152,6 +152,10 @@ class PackedFileMetadata {
 
   const std::shared_ptr<::parquet::FileMetaData>& GetParquetMetadata();
 
+  // Encrypted Parquet metadata contains reader-local decryptors whose keys are
+  // wiped on Close. Only metadata verified as plaintext by Make is reusable.
+  bool reusable_for_reading() const { return reusable_for_reading_; }
+
   const std::string& GetStorageVersion() const;
 
   int num_row_groups() const;
@@ -164,6 +168,7 @@ class PackedFileMetadata {
   std::map<FieldID, ColumnOffset> field_id_mapping_;
   GroupFieldIDList group_field_id_list_;
   std::string storage_version_;
+  bool reusable_for_reading_ = false;
 };
 
 }  // namespace milvus_storage

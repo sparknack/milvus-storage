@@ -326,8 +326,24 @@ arrow::Result<std::shared_ptr<PackedFileMetadata>> PackedFileMetadata::Make(
       field_id_mapping[field_id] = ColumnOffset(path, col);
     }
   }
-  return std::make_shared<PackedFileMetadata>(metadata, row_group_metadata, field_id_mapping, group_fields,
-                                              storage_version);
+  // The encryption_algorithm field identifies encrypted files with plaintext
+  // footers only. Encrypted footers omit it, so also inspect column crypto
+  // metadata. Arrow-written packed files encrypt at least one column in that
+  // mode (the writer checks that selected encrypted columns exist). Do this
+  // once, while the original reader's keys are still valid.
+  // Empty files have no loading work and are conservatively not shared.
+  bool reusable =
+      metadata->num_row_groups() > 0 && metadata->num_columns() > 0 && !metadata->is_encryption_algorithm_set();
+  for (int i = 0; reusable && i < metadata->num_row_groups(); ++i) {
+    auto row_group = metadata->RowGroup(i);
+    for (int j = 0; reusable && j < row_group->num_columns(); ++j) {
+      reusable = !row_group->ColumnChunk(j)->crypto_metadata();
+    }
+  }
+  auto packed = std::make_shared<PackedFileMetadata>(metadata, row_group_metadata, field_id_mapping, group_fields,
+                                                     storage_version);
+  packed->reusable_for_reading_ = reusable;
+  return packed;
 }
 
 const RowGroupMetadataVector PackedFileMetadata::GetRowGroupMetadataVector() { return row_group_metadata_; }

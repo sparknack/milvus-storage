@@ -56,9 +56,11 @@ arrow::Result<std::shared_ptr<FileRowGroupReader>> FileRowGroupReader::Make(
     const std::string& path,
     const int64_t buffer_size,
     const parquet::ReaderProperties& reader_props,
-    const parquet::ArrowReaderProperties& arrow_reader_props) {
+    const parquet::ArrowReaderProperties& arrow_reader_props,
+    std::shared_ptr<PackedFileMetadata> metadata) {
   auto reader = std::shared_ptr<FileRowGroupReader>(new FileRowGroupReader(fs, path, buffer_size, reader_props));
-  ARROW_RETURN_NOT_OK(reader->init(fs, path, buffer_size, nullptr, reader_props, arrow_reader_props));
+  ARROW_RETURN_NOT_OK(
+      reader->init(fs, path, buffer_size, nullptr, reader_props, arrow_reader_props, std::move(metadata)));
   return reader;
 }
 
@@ -68,10 +70,12 @@ arrow::Result<std::shared_ptr<FileRowGroupReader>> FileRowGroupReader::Make(
     const std::shared_ptr<arrow::Schema>& schema,
     const int64_t buffer_size,
     const parquet::ReaderProperties& reader_props,
-    const parquet::ArrowReaderProperties& arrow_reader_props) {
+    const parquet::ArrowReaderProperties& arrow_reader_props,
+    std::shared_ptr<PackedFileMetadata> metadata) {
   auto reader =
       std::shared_ptr<FileRowGroupReader>(new FileRowGroupReader(fs, path, schema, buffer_size, reader_props));
-  ARROW_RETURN_NOT_OK(reader->init(fs, path, buffer_size, schema, reader_props, arrow_reader_props));
+  ARROW_RETURN_NOT_OK(
+      reader->init(fs, path, buffer_size, schema, reader_props, arrow_reader_props, std::move(metadata)));
   return reader;
 }
 
@@ -80,16 +84,22 @@ arrow::Status FileRowGroupReader::init(std::shared_ptr<arrow::fs::FileSystem> fs
                                        const int64_t buffer_size,
                                        const std::shared_ptr<arrow::Schema>& schema,
                                        const parquet::ReaderProperties& reader_props,
-                                       const parquet::ArrowReaderProperties& arrow_reader_props) {
+                                       const parquet::ArrowReaderProperties& arrow_reader_props,
+                                       std::shared_ptr<PackedFileMetadata> cached_metadata) {
   fs_ = std::move(fs);
   path_ = path;
   buffer_size_limit_ = buffer_size <= 0 ? INT64_MAX : buffer_size;
 
   // Open the file
-  ARROW_ASSIGN_OR_RAISE(file_reader_, MakeArrowFileReader(*fs_, path_, reader_props, arrow_reader_props));
+  ARROW_ASSIGN_OR_RAISE(file_reader_,
+                        MakeArrowFileReader(*fs_, path_, reader_props, arrow_reader_props, cached_metadata));
 
   auto metadata = file_reader_->parquet_reader()->metadata();
-  ARROW_ASSIGN_OR_RAISE(file_metadata_, PackedFileMetadata::Make(metadata));
+  if (cached_metadata && cached_metadata->GetParquetMetadata() == metadata) {
+    file_metadata_ = std::move(cached_metadata);
+  } else {
+    ARROW_ASSIGN_OR_RAISE(file_metadata_, PackedFileMetadata::Make(metadata));
+  }
 
   // If schema is not provided, use the schema from the file
   if (schema == nullptr) {

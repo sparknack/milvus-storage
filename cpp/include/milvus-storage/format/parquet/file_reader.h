@@ -23,12 +23,16 @@ namespace milvus_storage {
 
 class FileRowGroupReader {
   public:
+  // Optional metadata is read-only and must come from the same immutable file.
+  // Readers retain independent cursors and buffers. Encrypted files are reopened
+  // without reusing metadata, so their decryption state remains reader-local.
   static arrow::Result<std::shared_ptr<FileRowGroupReader>> Make(
       const std::shared_ptr<arrow::fs::FileSystem>& fs,
       const std::string& path,
       const int64_t buffer_size = DEFAULT_READ_BUFFER_SIZE,
       const ::parquet::ReaderProperties& reader_props = ::parquet::default_reader_properties(),
-      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties());
+      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties(),
+      std::shared_ptr<PackedFileMetadata> metadata = nullptr);
 
   static arrow::Result<std::shared_ptr<FileRowGroupReader>> Make(
       const std::shared_ptr<arrow::fs::FileSystem>& fs,
@@ -36,7 +40,8 @@ class FileRowGroupReader {
       const std::shared_ptr<arrow::Schema>& schema,
       const int64_t buffer_size = DEFAULT_READ_BUFFER_SIZE,
       const ::parquet::ReaderProperties& reader_props = ::parquet::default_reader_properties(),
-      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties());
+      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties(),
+      std::shared_ptr<PackedFileMetadata> metadata = nullptr);
 
   arrow::Status SetRowGroupOffsetAndCount(int row_group_offset, int row_group_num);
 
@@ -98,7 +103,8 @@ class FileRowGroupReader {
       const int64_t buffer_size,
       const std::shared_ptr<arrow::Schema>& schema = nullptr,
       const ::parquet::ReaderProperties& reader_props = ::parquet::default_reader_properties(),
-      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties());
+      const ::parquet::ArrowReaderProperties& arrow_reader_props = ::parquet::default_arrow_reader_properties(),
+      std::shared_ptr<PackedFileMetadata> metadata = nullptr);
 
   /**
    * @brief Slices a row group from the table and updates the buffer state.

@@ -30,6 +30,7 @@
 #include <fmt/format.h>
 
 #include "milvus-storage/common/macro.h"
+#include "milvus-storage/common/metadata.h"
 
 namespace milvus_storage {
 
@@ -37,7 +38,8 @@ arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> MakeArrowFileReader(
     arrow::fs::FileSystem& fs,
     const std::string& file_path,
     const parquet::ReaderProperties& read_properties,
-    const parquet::ArrowReaderProperties& arrow_reader_properties) {
+    const parquet::ArrowReaderProperties& arrow_reader_properties,
+    std::shared_ptr<PackedFileMetadata> metadata) {
   ARROW_ASSIGN_OR_RAISE(auto file, fs.OpenInputFile(file_path));
   parquet::arrow::FileReaderBuilder builder;
   std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -50,7 +52,16 @@ arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> MakeArrowFileReader(
     read_properties_copy->file_decryption_properties(std::move(deep_copied_decryption));
   }
 
-  ARROW_RETURN_NOT_OK(builder.Open(std::move(file), *read_properties_copy));
+  // Closing an encrypted reader wipes the decryptor keys held by its metadata.
+  // Reopen encrypted files normally, even when the caller supplied a hint.
+  // Also preserve Arrow's rejection of plaintext files when decryption policy
+  // requires encryption; passing metadata would skip that footer-time check.
+  const auto& decryption = read_properties_copy->file_decryption_properties();
+  if (metadata && (!metadata->reusable_for_reading() || (decryption && !decryption->plaintext_files_allowed()))) {
+    metadata.reset();
+  }
+  ARROW_RETURN_NOT_OK(
+      builder.Open(std::move(file), *read_properties_copy, metadata ? metadata->GetParquetMetadata() : nullptr));
   ARROW_RETURN_NOT_OK(
       builder.memory_pool(arrow::default_memory_pool())->properties(arrow_reader_properties)->Build(&reader));
   return std::move(reader);
