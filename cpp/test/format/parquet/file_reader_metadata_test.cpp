@@ -94,7 +94,9 @@ class CountingFileSystem : public arrow::fs::LocalFileSystem {
 
 // Real packed Parquet bytes, with four distinguishable row groups.
 arrow::Result<std::shared_ptr<arrow::Buffer>> MakePackedFile(
-    int64_t base = 0, std::shared_ptr<parquet::FileEncryptionProperties> encryption = nullptr) {
+    int64_t base = 0,
+    std::shared_ptr<parquet::FileEncryptionProperties> encryption = nullptr,
+    bool add_plain_column = false) {
   arrow::Int64Builder values;
   for (int64_t i = 0; i < 16; ++i) {
     ARROW_RETURN_NOT_OK(values.Append(base + i));
@@ -104,12 +106,21 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> MakePackedFile(
   for (int64_t i = 0; i < 4; ++i) {
     row_groups.Add(RowGroupMetadata(32, 4, i * 4));
   }
-  GroupFieldIDList groups(std::vector<FieldIDList>{FieldIDList(std::vector<FieldID>{100})});
+  std::vector<FieldID> ids{100};
+  std::vector<std::shared_ptr<arrow::Field>> fields{
+      arrow::field("value", arrow::int64(), false, arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"100"}))};
+  std::vector<std::shared_ptr<arrow::Array>> arrays{array};
+  if (add_plain_column) {
+    ids.push_back(101);
+    fields.push_back(
+        arrow::field("plain", arrow::int64(), false, arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"101"})));
+    arrays.push_back(array);
+  }
+  GroupFieldIDList groups(std::vector<FieldIDList>{FieldIDList(ids)});
   auto schema = arrow::schema(
-      {arrow::field("value", arrow::int64(), false, arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"100"}))},
-      arrow::key_value_metadata({ROW_GROUP_META_KEY, STORAGE_VERSION_KEY, GROUP_FIELD_ID_LIST_META_KEY},
-                                {row_groups.Serialize(), "1.0.0", groups.Serialize()}));
-  auto table = arrow::Table::Make(schema, {array});
+      fields, arrow::key_value_metadata({ROW_GROUP_META_KEY, STORAGE_VERSION_KEY, GROUP_FIELD_ID_LIST_META_KEY},
+                                        {row_groups.Serialize(), "1.0.0", groups.Serialize()}));
+  auto table = arrow::Table::Make(schema, arrays);
   ARROW_ASSIGN_OR_RAISE(auto sink, arrow::io::BufferOutputStream::Create());
   parquet::WriterProperties::Builder properties;
   if (encryption) {
@@ -237,6 +248,51 @@ TEST_F(FileReaderMetadataTest, EncryptedFilesReopenWithFreshKeys) {
     properties.file_decryption_properties(wrong_key.build());
     EXPECT_FALSE(Open(metadata, properties).ok());
   }
+}
+
+TEST_F(FileReaderMetadataTest, ColumnKeysAreNotNeededToOpenFooter) {
+  for (bool plaintext_footer : {false, true}) {
+    parquet::FileEncryptionProperties::Builder encryption("0123456789012345");
+    if (plaintext_footer)
+      encryption.set_plaintext_footer();
+    parquet::ColumnEncryptionProperties::Builder column("value");
+    column.key("abcdefghijklmnop");
+    encryption.encrypted_columns({{"value", column.build()}});
+    auto data = MakePackedFile(0, encryption.build(), true);
+    ASSERT_TRUE(data.ok()) << data.status();
+    fs->files["file"] = *data;
+    parquet::FileDecryptionProperties::Builder decryption;
+    decryption.footer_key("0123456789012345");
+    auto properties = parquet::default_reader_properties();
+    properties.file_decryption_properties(decryption.build());
+    // No column key is available. Opening metadata must still succeed.
+    auto first = Open(nullptr, properties);
+    ASSERT_TRUE(first.ok()) << first.status();
+    auto metadata = (*first)->file_metadata();
+    EXPECT_FALSE(metadata->reusable_for_reading());
+    ASSERT_TRUE((*first)->Close().ok());
+    auto schema = arrow::schema(
+        {arrow::field("plain", arrow::int64(), false, arrow::key_value_metadata({ARROW_FIELD_ID_KEY}, {"101"}))});
+    auto projected = FileRowGroupReader::Make(fs, "file", schema, 32, properties,
+                                              parquet::default_arrow_reader_properties(), metadata);
+    ASSERT_TRUE(projected.ok()) << projected.status();
+    EXPECT_NE((*projected)->file_metadata(), metadata);
+    std::shared_ptr<arrow::Table> table;
+    // Reading the encrypted column still requires its key; no checks are bypassed.
+    auto all_columns = Open(nullptr, properties);
+    ASSERT_TRUE(all_columns.ok()) << all_columns.status();
+    ASSERT_TRUE((*all_columns)->SetRowGroupOffsetAndCount(0, 1).ok());
+    EXPECT_FALSE((*all_columns)->ReadNextRowGroup(&table).ok());
+  }
+}
+
+TEST_F(FileReaderMetadataTest, GenericMetadataConstructionDoesNotClaimReuseEligibility) {
+  auto reader = MakeArrowFileReader(*fs, "file", parquet::default_reader_properties(),
+                                    parquet::default_arrow_reader_properties());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  auto metadata = PackedFileMetadata::Make((*reader)->parquet_reader()->metadata());
+  ASSERT_TRUE(metadata.ok()) << metadata.status();
+  EXPECT_FALSE((*metadata)->reusable_for_reading());
 }
 
 }  // namespace

@@ -14,6 +14,8 @@
 
 #include "milvus-storage/common/arrow_util.h"
 
+#include <atomic>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <vector>
@@ -24,6 +26,7 @@
 #include <arrow/array/data.h>
 #include <arrow/chunk_resolver.h>
 #include <arrow/type.h>
+#include <arrow/util/future.h>
 #include <arrow/table.h>
 #include <arrow/util/key_value_metadata.h>
 #include <arrow/record_batch.h>
@@ -34,12 +37,85 @@
 
 namespace milvus_storage {
 
+namespace {
+
+// Observe Arrow's existing synchronous footer read. Do not read/decrypt column
+// metadata, issue extra I/O, or alter the underlying file's async read behavior.
+class FooterProbeFile : public arrow::io::RandomAccessFile {
+  public:
+  explicit FooterProbeFile(std::shared_ptr<arrow::io::RandomAccessFile> file) : file_(std::move(file)) {}
+
+  arrow::Status Close() override { return file_->Close(); }
+  arrow::Future<> CloseAsync() override { return file_->CloseAsync(); }
+  arrow::Status Abort() override { return file_->Abort(); }
+  bool closed() const override { return file_->closed(); }
+  arrow::Result<int64_t> Tell() const override { return file_->Tell(); }
+  arrow::Status Seek(int64_t position) override { return file_->Seek(position); }
+  const arrow::io::IOContext& io_context() const override { return file_->io_context(); }
+  bool supports_zero_copy() const override { return file_->supports_zero_copy(); }
+  arrow::Result<std::string_view> Peek(int64_t nbytes) override { return file_->Peek(nbytes); }
+  arrow::Result<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadata() override {
+    return file_->ReadMetadata();
+  }
+  arrow::Future<std::shared_ptr<const arrow::KeyValueMetadata>> ReadMetadataAsync(
+      const arrow::io::IOContext& context) override {
+    return file_->ReadMetadataAsync(context);
+  }
+  arrow::Result<int64_t> Read(int64_t nbytes, void* out) override { return file_->Read(nbytes, out); }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override { return file_->Read(nbytes); }
+  arrow::Result<int64_t> GetSize() override {
+    ARROW_ASSIGN_OR_RAISE(auto size, file_->GetSize());
+    size_.store(size, std::memory_order_relaxed);
+    return size;
+  }
+  arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+    ARROW_ASSIGN_OR_RAISE(auto size, file_->ReadAt(position, nbytes, out));
+    Observe(position, size, static_cast<const uint8_t*>(out));
+    return size;
+  }
+  arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
+    ARROW_ASSIGN_OR_RAISE(auto buffer, file_->ReadAt(position, nbytes));
+    if (buffer)
+      Observe(position, buffer->size(), buffer->data());
+    return buffer;
+  }
+  arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(const arrow::io::IOContext& context,
+                                                          int64_t position,
+                                                          int64_t nbytes) override {
+    return file_->ReadAsync(context, position, nbytes);
+  }
+  std::vector<arrow::Future<std::shared_ptr<arrow::Buffer>>> ReadManyAsync(
+      const arrow::io::IOContext& context, const std::vector<arrow::io::ReadRange>& ranges) override {
+    return file_->ReadManyAsync(context, ranges);
+  }
+  arrow::Status WillNeed(const std::vector<arrow::io::ReadRange>& ranges) override { return file_->WillNeed(ranges); }
+  bool plaintext_footer() const { return plaintext_footer_.load(std::memory_order_relaxed); }
+
+  private:
+  void Observe(int64_t position, int64_t size, const uint8_t* data) {
+    auto file_size = size_.load(std::memory_order_relaxed);
+    if (size >= 4 && file_size >= size && position == file_size - size) {
+      // PAR1 also occurs in encrypted files with plaintext footers. The caller
+      // checks the footer's encryption_algorithm flag before permitting reuse.
+      plaintext_footer_.store(std::memcmp(data + size - 4, "PAR1", 4) == 0, std::memory_order_relaxed);
+    }
+  }
+  std::shared_ptr<arrow::io::RandomAccessFile> file_;
+  std::atomic<int64_t> size_{-1};
+  std::atomic<bool> plaintext_footer_{false};
+};
+
+}  // namespace
+
 arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> MakeArrowFileReader(
     arrow::fs::FileSystem& fs,
     const std::string& file_path,
     const parquet::ReaderProperties& read_properties,
     const parquet::ArrowReaderProperties& arrow_reader_properties,
-    std::shared_ptr<PackedFileMetadata> metadata) {
+    std::shared_ptr<PackedFileMetadata> metadata,
+    bool* metadata_reusable) {
+  if (metadata_reusable)
+    *metadata_reusable = false;
   ARROW_ASSIGN_OR_RAISE(auto file, fs.OpenInputFile(file_path));
   parquet::arrow::FileReaderBuilder builder;
   std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -60,10 +136,19 @@ arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> MakeArrowFileReader(
   if (metadata && (!metadata->reusable_for_reading() || (decryption && !decryption->plaintext_files_allowed()))) {
     metadata.reset();
   }
+  std::shared_ptr<FooterProbeFile> probe;
+  if (metadata_reusable && !metadata) {
+    probe = std::make_shared<FooterProbeFile>(std::move(file));
+    file = probe;
+  }
   ARROW_RETURN_NOT_OK(
       builder.Open(std::move(file), *read_properties_copy, metadata ? metadata->GetParquetMetadata() : nullptr));
   ARROW_RETURN_NOT_OK(
       builder.memory_pool(arrow::default_memory_pool())->properties(arrow_reader_properties)->Build(&reader));
+  if (metadata_reusable) {
+    *metadata_reusable = metadata != nullptr || (probe && probe->plaintext_footer() &&
+                                                 !reader->parquet_reader()->metadata()->is_encryption_algorithm_set());
+  }
   return std::move(reader);
 }
 

@@ -91,14 +91,16 @@ arrow::Status FileRowGroupReader::init(std::shared_ptr<arrow::fs::FileSystem> fs
   buffer_size_limit_ = buffer_size <= 0 ? INT64_MAX : buffer_size;
 
   // Open the file
-  ARROW_ASSIGN_OR_RAISE(file_reader_,
-                        MakeArrowFileReader(*fs_, path_, reader_props, arrow_reader_props, cached_metadata));
+  bool metadata_reusable = false;
+  ARROW_ASSIGN_OR_RAISE(file_reader_, MakeArrowFileReader(*fs_, path_, reader_props, arrow_reader_props,
+                                                          cached_metadata, &metadata_reusable));
 
   auto metadata = file_reader_->parquet_reader()->metadata();
   if (cached_metadata && cached_metadata->GetParquetMetadata() == metadata) {
     file_metadata_ = std::move(cached_metadata);
   } else {
     ARROW_ASSIGN_OR_RAISE(file_metadata_, PackedFileMetadata::Make(metadata));
+    file_metadata_->reusable_for_reading_ = metadata_reusable;
   }
 
   // If schema is not provided, use the schema from the file

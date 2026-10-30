@@ -69,12 +69,15 @@ inline int64_t GetFieldId(const std::shared_ptr<arrow::Field>& field) {
 
 // metadata must belong to the same immutable file and filesystem as file_path.
 // Encrypted metadata is deliberately not reused: it owns reader-local decryptors.
+// If requested, metadata_reusable reports verified plaintext metadata without
+// requesting column keys. Unknown/unobserved footer formats remain ineligible.
 arrow::Result<std::unique_ptr<::parquet::arrow::FileReader>> MakeArrowFileReader(
     arrow::fs::FileSystem& fs,
     const std::string& file_path,
     const ::parquet::ReaderProperties& read_properties,
     const ::parquet::ArrowReaderProperties& arrow_reader_properties,
-    std::shared_ptr<PackedFileMetadata> metadata = nullptr);
+    std::shared_ptr<PackedFileMetadata> metadata = nullptr,
+    bool* metadata_reusable = nullptr);
 
 size_t GetRecordBatchMemorySize(const std::shared_ptr<arrow::RecordBatch>& record_batch);
 

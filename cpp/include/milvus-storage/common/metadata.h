@@ -153,7 +153,7 @@ class PackedFileMetadata {
   const std::shared_ptr<::parquet::FileMetaData>& GetParquetMetadata();
 
   // Encrypted Parquet metadata contains reader-local decryptors whose keys are
-  // wiped on Close. Only metadata verified as plaintext by Make is reusable.
+  // wiped on Close. Only FileRowGroupReader can mark a verified plaintext file.
   bool reusable_for_reading() const { return reusable_for_reading_; }
 
   const std::string& GetStorageVersion() const;
@@ -163,6 +163,7 @@ class PackedFileMetadata {
   size_t total_memory_size() const;
 
   private:
+  friend class FileRowGroupReader;
   std::shared_ptr<::parquet::FileMetaData> parquet_metadata_;
   RowGroupMetadataVector row_group_metadata_;
   std::map<FieldID, ColumnOffset> field_id_mapping_;
